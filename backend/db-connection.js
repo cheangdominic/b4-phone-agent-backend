@@ -4,7 +4,7 @@ dotenv.config();
 
 async function connectDB() {
   try {
-    const connection = await mysql.createConnection({
+    connection = await mysql.createConnection({
       host: process.env.DB_HOST,
       user: process.env.DB_USER,
       password: process.env.DB_PASSWORD,
@@ -13,10 +13,11 @@ async function connectDB() {
     });
 
     console.log("✅ Connected to MySQL!");
-    await connection.end();
   } catch (err) {
     console.error("❌ Connection failed:", err.message);
   }
 }
 
-connectDB();
+await connectDB();
+
+export default connection;
