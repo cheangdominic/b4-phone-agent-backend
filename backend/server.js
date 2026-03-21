@@ -69,6 +69,31 @@ app.post("/login", async (req, res) => {
   }
 });
 
+app.get("/is-admin", async (req, res) => {
+  const { email } = req.query;
+
+  try {
+    if (!email) {
+      return res.status(400).json({ error: "Email is required" });
+    }
+
+    const [rows] = await pool.query("SELECT admin FROM users WHERE email = ?", [
+      email,
+    ]);
+
+    if (rows.length === 0) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    const isAdmin = rows[0].admin === 1 || rows[0].admin === true;
+
+    res.status(200).json({ admin: isAdmin });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
 app.post("/forgot-password", async (req, res) => {
   const { email } = req.body;
 
