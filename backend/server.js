@@ -112,6 +112,74 @@ app.post("/forgot-password", async (req, res) => {
   }
 });
 
+app.post("/reset-password", async (req, res) => {
+  const token = req.query.token;
+  const { password, confirmPassword } = req.body;
+
+  try {
+    if (!password || !confirmPassword) {
+      return res.status(400).json({ error: "Missing fields" });
+    }
+
+    if (password !== confirmPassword) {
+      return res.status(400).json({ error: "Passwords do not match" });
+    }
+
+    const [rows] = await pool.query(
+      "SELECT * FROM users WHERE reset_token = ?",
+      [token],
+    );
+
+    if (rows.length === 0) {
+      return res.status(401).json({ error: "Token expired or does not exist" });
+    }
+
+    const user = rows[0];
+
+    if (Date.now() > user.reset_token_expiry) {
+      return res.status(401).json({ error: "Token expired" });
+    }
+
+    const hashedPassword = await bcrypt.hash(password, 10);
+
+    const matchOld = await bcrypt.compare(password, user.password);
+
+    if (matchOld) {
+      return res.status(400).json({
+        error: "New password must be different from the current password",
+      });
+    }
+
+    await pool.query(
+      "UPDATE users SET password = ?, reset_token = NULL, reset_token_expiry = NULL WHERE email = ?",
+      [hashedPassword, user.email],
+    );
+    res.status(200).json({ message: "Password has been reset successfully" });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+app.get("/verify-token", async (req, res) => {
+  const token = req.query.token;
+
+  const [rows] = await pool.query("SELECT * FROM users WHERE reset_token = ?", [
+    token,
+  ]);
+
+  if (rows.length === 0) {
+    return res.json({ valid: false });
+  }
+
+  const user = rows[0];
+  if (Date.now() > user.reset_token_expiry) {
+    return res.json({ valid: false });
+  }
+
+  res.json({ valid: true });
+});
+
 app.listen(3000, () => {
   console.log("Server running on port 3000");
 });
