@@ -281,15 +281,17 @@ router.get("/is-admin", authenticateToken, async (req, res) => {
 
 router.get("/my-dashboard", authenticateToken, async (req, res) => {
   try {
-    const [rows] = await pool.query("SELECT email, api_calls FROM users WHERE email = ?", [req.user.email]);
+    const [rows] = await pool.query("SELECT email, api_calls, admin FROM users WHERE email = ?", [req.user.email]);
 
-    const userData = rows[0] || { email: req.user.email, api_calls: 0, admin: 0 };
-
-    res.json({ 
-      email: userData.email, 
-      api_calls: userData.api_calls, 
-      is_admin: userData.admin 
-    });
+    if (rows.length > 0) {
+      res.json({ 
+        email: rows[0].email, 
+        api_calls: rows[0].api_calls, 
+        is_admin: rows[0].admin // This matches the Dashboard.jsx 'is_admin' check
+      });
+    } else {
+      res.status(404).json({ error: "User not found" });
+    }
 
   } catch (err) {
     console.error("DASHBOARD CRASH:", err);
