@@ -261,8 +261,8 @@ router.post("/process-speech", async (req, res) => {
   }
 });
 
-router.get("/is-admin", async (req, res) => {
-  const { email } = req.query;
+router.get("/is-admin", authenticateToken, async (req, res) => {
+  const email = req.user.email;
   if (!email) return res.status(400).json({ error: "Email is required" });
 
   try {
@@ -275,6 +275,26 @@ router.get("/is-admin", async (req, res) => {
     res.json({ admin: !!rows[0].admin });
   } catch (err) {
     console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+router.get("/my-dashboard", authenticateToken, async (req, res) => {
+  try {
+    const [rows] = await pool.query("SELECT email, api_calls FROM users WHERE email = ?", [req.user.email]);
+    res.json(rows[0] || { email: req.user.email, api_calls: 0 });
+  } catch (err) {
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+router.get("/admin/usage", authenticateToken, async (req, res) => {
+  if (!req.user.admin) return res.status(403).json({ error: "Admin access required." });
+
+  try {
+    const [rows] = await pool.query("SELECT id, email, api_calls, admin FROM users ORDER BY api_calls DESC");
+    res.json(rows);
+  } catch (err) {
     res.status(500).json({ error: "Server error" });
   }
 });
