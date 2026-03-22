@@ -2,16 +2,18 @@ import express from "express";
 import pool from "./db-connection.js";
 import bcrypt from "bcrypt";
 import cors from "cors";
-import crypto from "crypto";
-import nodemailer from "nodemailer";
 import dotenv from "dotenv";
 import twilio from "twilio";
 import fetch from "node-fetch";
 import jwt from "jsonwebtoken";
+import xss from "xss";
+import helmet from "helmet";
 
 dotenv.config();
 
 const app = express();
+
+app.use(helmet());
 
 app.use(
   cors({
@@ -62,13 +64,25 @@ const authenticateToken = (req, res, next) => {
   const authHeader = req.headers["authorization"];
   const token = authHeader && authHeader.split(" ")[1];
 
-  if (!token) return res.status(401).json({ error: "Access denied. No token provided."});
+  if (!token) {
+    return res.status(401).json({ error: "Access denied. No token provided." });
+  }
 
-  jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
-    if (err) return res.status(403).json({ error: "Invalid or expired token." });
-    req.user = user; 
-    next();
-  });
+  jwt.verify(
+    token,
+    process.env.JWT_SECRET,
+    {
+      issuer: "b4-phone-agent",
+      audience: "users",
+    },
+    (err, user) => {
+      if (err) {
+        return res.status(403).json({ error: "Invalid or expired token." });
+      }
+      req.user = user;
+      next();
+    },
+  );
 };
 
 const router = express.Router();
@@ -79,7 +93,14 @@ router.get("/", (req, res) => {
 });
 
 router.post("/signup", async (req, res) => {
-  const { email, password } = req.body;
+  let { email, password } = req.body;
+
+  email = xss(email).trim();
+
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    return res.status(400).json({ error: "Invalid email format" });
+  }
+
   if (!email || !password)
     return res.status(400).json({ error: "Missing fields" });
 
@@ -103,7 +124,14 @@ router.post("/signup", async (req, res) => {
 });
 
 router.post("/login", async (req, res) => {
-  const { email, password } = req.body;
+  let { email, password } = req.body;
+
+  email = xss(email).trim();
+
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    return res.status(400).json({ error: "Invalid email format" });
+  }
+
   if (!email || !password)
     return res.status(400).json({ error: "Missing fields" });
 
@@ -122,7 +150,11 @@ router.post("/login", async (req, res) => {
     const token = jwt.sign(
       { email: user.email, admin: user.admin },
       process.env.JWT_SECRET,
-      { expiresIn: "24h" }
+      {
+        expiresIn: "1h",
+        issuer: "b4-phone-agent",
+        audience: "users",
+      },
     );
 
     res.status(200).json({ message: "Login successful", email, token });
@@ -133,7 +165,11 @@ router.post("/login", async (req, res) => {
 });
 
 router.post("/call", authenticateToken, async (req, res) => {
-  const { goal, phoneNumber } = req.body;
+  let { goal, phoneNumber } = req.body;
+
+  goal = xss(goal).trim();
+  phoneNumber = xss(phoneNumber).trim();
+
   const email = req.user.email;
 
   if (!goal || !phoneNumber)
@@ -213,7 +249,8 @@ router.post("/voice", async (req, res) => {
 router.post("/process-speech", async (req, res) => {
   const twiml = new VoiceResponse();
   const callId = req.query.call_id;
-  const userSpeech = req.body.SpeechResult || "";
+  let userSpeech = req.body.SpeechResult || "";
+  userSpeech = xss(userSpeech);
 
   if (!callId) {
     twiml.say("Error: call ID missing.");
@@ -258,24 +295,6 @@ router.post("/process-speech", async (req, res) => {
     twiml.say("Sorry, something went wrong.");
     res.type("text/xml");
     res.send(twiml.toString());
-  }
-});
-
-router.get("/is-admin", authenticateToken, async (req, res) => {
-  const email = req.user.email;
-  if (!email) return res.status(400).json({ error: "Email is required" });
-
-  try {
-    const [rows] = await pool.query("SELECT admin FROM users WHERE email = ?", [
-      email,
-    ]);
-    if (rows.length === 0)
-      return res.status(404).json({ error: "User not found" });
-
-    res.json({ admin: !!rows[0].admin });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Server error" });
   }
 });
 
