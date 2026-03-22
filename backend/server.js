@@ -13,7 +13,7 @@ const app = express();
 
 app.use(
   cors({
-    origin: ["https://valleybalfour.dev", "http://localhost:3000"],
+    origin: ["https://valleybalfour.dev", "http://localhost:5173"],
     credentials: true,
   }),
 );
