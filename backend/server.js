@@ -282,8 +282,17 @@ router.get("/is-admin", authenticateToken, async (req, res) => {
 router.get("/my-dashboard", authenticateToken, async (req, res) => {
   try {
     const [rows] = await pool.query("SELECT email, api_calls FROM users WHERE email = ?", [req.user.email]);
-    res.json(rows[0] || { email: req.user.email, api_calls: 0 });
+
+    const userData = rows[0] || { email: req.user.email, api_calls: 0, admin: 0 };
+
+    res.json({ 
+      email: userData.email, 
+      api_calls: userData.api_calls, 
+      is_admin: userData.admin 
+    });
+
   } catch (err) {
+    console.error("DASHBOARD CRASH:", err);
     res.status(500).json({ error: "Server error" });
   }
 });
