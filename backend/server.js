@@ -7,6 +7,7 @@ import nodemailer from "nodemailer";
 import dotenv from "dotenv";
 import twilio from "twilio";
 import fetch from "node-fetch";
+import jwt from "jsonwebtoken";
 
 dotenv.config();
 
@@ -57,6 +58,19 @@ async function getAIResponse(prompt) {
   }
 }
 
+const authenticateToken = (req, res, next) => {
+  const authHeader = req.headers["authorization"];
+  const token = authHeader && authHeader.split(" ")[1];
+
+  if (!token) return res.status(401).json({ error: "Access denied. No token provided."});
+
+  jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
+    if (err) return res.status(403).json({ error: "Invalid or expired token." });
+    req.user = user; 
+    next();
+  });
+};
+
 const router = express.Router();
 
 router.get("/", (req, res) => {
@@ -105,20 +119,36 @@ router.post("/login", async (req, res) => {
     if (!match)
       return res.status(401).json({ error: "Invalid email or password" });
 
-    res.status(200).json({ message: "Login successful", email });
+    const token = jwt.sign(
+      { email: user.email, admin: user.admin },
+      process.env.JWT_SECRET,
+      { expiresIn: "24h" }
+    );
+
+    res.status(200).json({ message: "Login successful", email, token });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Database error" });
   }
 });
 
-router.post("/call", async (req, res) => {
-  const { email, goal, phoneNumber } = req.body;
+router.post("/call", authenticateToken, async (req, res) => {
+  const { goal, phoneNumber } = req.body;
+  const email = req.user.email;
 
-  if (!email || !goal || !phoneNumber)
+  if (!goal || !phoneNumber)
     return res.status(400).json({ error: "Missing fields" });
 
   try {
+    await pool.query("UPDATE users SET api_calls = COALESCE(api_calls, 0) + 1 WHERE email = ?", [email]);
+    const [userRows] = await pool.query("SELECT api_calls FROM users WHERE email = ?", [email]);
+    const totalCalls = userRows[0].api_calls;
+
+    let warningMessage = null;
+    if (totalCalls > 20) {
+      warningMessage = "Limit Reached: You have consumed your 20 free API calls. Additional charges may apply.";
+    }
+
     const [result] = await pool.query("INSERT INTO calls (email) VALUES (?)", [
       email,
     ]);
@@ -137,7 +167,12 @@ router.post("/call", async (req, res) => {
       url: `https://valleybalfour.dev/voice?call_id=${callId}`,
     });
 
-    res.json({ call_id: callId, twilioCallSid: call.sid });
+    res.json({ 
+      call_id: callId, 
+      twilioCallSid: call.sid,
+      api_calls: totalCalls,
+      warning: warningMessage 
+    });
   } catch (err) {
     console.error("FULL ERROR:", err);
     res.status(500).json({ error: err.message });
