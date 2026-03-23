@@ -8,6 +8,8 @@ import fetch from "node-fetch";
 import jwt from "jsonwebtoken";
 import xss from "xss";
 import helmet from "helmet";
+import crypto from "crypto";
+import nodemailer from "nodemailer";
 
 dotenv.config();
 
@@ -29,34 +31,60 @@ const VoiceResponse = twilio.twiml.VoiceResponse;
 const client = twilio(process.env.TWILIO_SID, process.env.TWILIO_AUTH_TOKEN);
 
 async function getAIResponse(prompt) {
+  const url = "https://api.openai.com/v1/chat/completions";
+
   try {
-    const response = await fetch(
-      "https://router.huggingface.co/v1/chat/completions",
-      {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${process.env.HF_API_KEY}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          model: "gpt2",
-          messages: [
-            { role: "system", content: "You are a helpful AI." },
-            { role: "user", content: prompt },
-          ],
-          max_tokens: 100,
-          temperature: 0.7,
-        }),
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 20000);
+
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
       },
-    );
+      body: JSON.stringify({
+        model: "gpt-3.5-turbo",
+        messages: [
+          { role: "system", content: "You are a helpful AI voice assistant." },
+          { role: "user", content: prompt },
+        ],
+        temperature: 0.7,
+      }),
+      signal: controller.signal,
+    });
 
-    const data = await response.json();
-    console.log("HF CHAT RESPONSE:", data);
+    clearTimeout(timeout);
 
-    return data.choices?.[0]?.message?.content || "No response.";
+    const text = await response.text();
+
+    if (!response.ok) {
+      switch (response.status) {
+        case 401:
+          return "AI Error: Invalid OpenAI API key.";
+        case 429:
+          return "AI Error: Rate limit exceeded. Try again shortly.";
+        case 500:
+        case 502:
+        case 503:
+          return "AI Error: OpenAI servers are having issues.";
+        default:
+          return `AI Error (${response.status}): ${text.substring(0, 200)}`;
+      }
+    }
+
+    let data;
+    try {
+      data = JSON.parse(text);
+    } catch {
+      return "AI Error: Invalid JSON from OpenAI.";
+    }
+
+    const aiMessage = data?.choices?.[0]?.message?.content;
+    return aiMessage ? aiMessage.trim() : "AI Error: No response from OpenAI.";
   } catch (err) {
-    console.error("HF ERROR:", err);
-    return "AI service error.";
+    if (err.name === "AbortError") return "AI Error: Request timed out.";
+    return `AI Error: ${err.message}`;
   }
 }
 
@@ -84,6 +112,16 @@ const authenticateToken = (req, res, next) => {
     },
   );
 };
+
+function escapeHtml(text) {
+  if (!text) return "";
+  return text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
 
 const router = express.Router();
 
@@ -118,7 +156,6 @@ router.post("/signup", async (req, res) => {
     );
     res.status(201).json({ message: "User registered successfully" });
   } catch (err) {
-    console.error(err);
     res.status(500).json({ error: "Database error" });
   }
 });
@@ -200,17 +237,11 @@ router.post("/call", authenticateToken, async (req, res) => {
     const call = await client.calls.create({
       to: phoneNumber,
       from: process.env.TWILIO_PHONE_NUMBER,
-      url: `https://valleybalfour.dev/voice?call_id=${callId}`,
+      url: `https://valleybalfour.dev/b4backend/voice?call_id=${callId}`,
     });
 
-    res.json({ 
-      call_id: callId, 
-      twilioCallSid: call.sid,
-      api_calls: totalCalls,
-      warning: warningMessage 
-    });
+    res.json({ call_id: callId, twilioCallSid: call.sid });
   } catch (err) {
-    console.error("FULL ERROR:", err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -231,13 +262,11 @@ router.post("/voice", async (req, res) => {
       [callId],
     );
     if (rows.length > 0) aiMessage = rows[0].message;
-  } catch (err) {
-    console.error(err);
-  }
+  } catch {}
 
   const gather = twiml.gather({
     input: "speech",
-    action: `/process-speech?call_id=${callId}`,
+    action: `/b4backend/process-speech?call_id=${callId}`,
     method: "POST",
   });
   gather.say(aiMessage);
@@ -275,23 +304,21 @@ router.post("/process-speech", async (req, res) => {
     prompt += "AI:";
 
     const aiResponse = await getAIResponse(prompt);
-
     await pool.query(
       "INSERT INTO conversations (call_id, sender, message) VALUES (?, ?, ?)",
       [callId, "ai", aiResponse],
     );
 
     twiml.say(aiResponse);
-    const gather = twiml.gather({
+    twiml.gather({
       input: "speech",
-      action: `/process-speech?call_id=${callId}`,
+      action: `/b4backend/process-speech?call_id=${callId}`,
       method: "POST",
     });
 
     res.type("text/xml");
     res.send(twiml.toString());
-  } catch (err) {
-    console.error("Error processing speech:", err);
+  } catch {
     twiml.say("Sorry, something went wrong.");
     res.type("text/xml");
     res.send(twiml.toString());
@@ -330,6 +357,66 @@ router.get("/admin/usage", authenticateToken, async (req, res) => {
 });
 
 app.use("", router);
+router.get("/ai-response", async (req, res) => {
+  const { prompt } = req.query;
+  if (!prompt)
+    return res.status(400).json({ error: "Missing prompt parameter." });
+
+  try {
+    const aiResponse = await getAIResponse(prompt);
+    res.json({
+      prompt,
+      response: aiResponse,
+      timestamp: new Date().toISOString(),
+      status: "success",
+    });
+  } catch (err) {
+    res
+      .status(500)
+      .json({
+        error: "Failed to get AI response",
+        details: err.message,
+        timestamp: new Date().toISOString(),
+      });
+  }
+});
+
+router.get("/ai-response/html", async (req, res) => {
+  const { prompt } = req.query;
+
+  if (!prompt) {
+    return res.send(`
+      <!DOCTYPE html><html><head><title>AI Response Tester</title></head>
+      <body>
+        <form method="get" action="/b4backend/ai-response/html">
+          <input type="text" name="prompt" required>
+          <button type="submit">Get AI Response</button>
+        </form>
+      </body></html>
+    `);
+  }
+
+  try {
+    const aiResponse = await getAIResponse(prompt);
+    res.send(`
+      <!DOCTYPE html><html><head><title>AI Response</title></head>
+      <body>
+        <div>Prompt: ${escapeHtml(prompt)}</div>
+        <div>Response: ${escapeHtml(aiResponse)}</div>
+        <div>Generated: ${new Date().toISOString()}</div>
+      </body></html>
+    `);
+  } catch (err) {
+    res.send(`
+      <!DOCTYPE html><html><head><title>Error</title></head>
+      <body>
+        <div>Error: ${escapeHtml(err.message)}</div>
+      </body></html>
+    `);
+  }
+});
+
+app.use("/b4backend", router);
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
