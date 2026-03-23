@@ -2,15 +2,18 @@ import express from "express";
 import pool from "./db-connection.js";
 import bcrypt from "bcrypt";
 import cors from "cors";
-import crypto from "crypto";
-import nodemailer from "nodemailer";
 import dotenv from "dotenv";
 import twilio from "twilio";
 import fetch from "node-fetch";
+import jwt from "jsonwebtoken";
+import xss from "xss";
+import helmet from "helmet";
 
 dotenv.config();
 
 const app = express();
+
+app.use(helmet());
 
 app.use(
   cors({
@@ -57,6 +60,31 @@ async function getAIResponse(prompt) {
   }
 }
 
+const authenticateToken = (req, res, next) => {
+  const authHeader = req.headers["authorization"];
+  const token = authHeader && authHeader.split(" ")[1];
+
+  if (!token) {
+    return res.status(401).json({ error: "Access denied. No token provided." });
+  }
+
+  jwt.verify(
+    token,
+    process.env.JWT_SECRET,
+    {
+      issuer: "b4-phone-agent",
+      audience: "users",
+    },
+    (err, user) => {
+      if (err) {
+        return res.status(403).json({ error: "Invalid or expired token." });
+      }
+      req.user = user;
+      next();
+    },
+  );
+};
+
 const router = express.Router();
 
 router.get("/", (req, res) => {
@@ -65,7 +93,14 @@ router.get("/", (req, res) => {
 });
 
 router.post("/signup", async (req, res) => {
-  const { email, password } = req.body;
+  let { email, password } = req.body;
+
+  email = xss(email).trim();
+
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    return res.status(400).json({ error: "Invalid email format" });
+  }
+
   if (!email || !password)
     return res.status(400).json({ error: "Missing fields" });
 
@@ -89,7 +124,14 @@ router.post("/signup", async (req, res) => {
 });
 
 router.post("/login", async (req, res) => {
-  const { email, password } = req.body;
+  let { email, password } = req.body;
+
+  email = xss(email).trim();
+
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    return res.status(400).json({ error: "Invalid email format" });
+  }
+
   if (!email || !password)
     return res.status(400).json({ error: "Missing fields" });
 
@@ -105,20 +147,44 @@ router.post("/login", async (req, res) => {
     if (!match)
       return res.status(401).json({ error: "Invalid email or password" });
 
-    res.status(200).json({ message: "Login successful", email });
+    const token = jwt.sign(
+      { email: user.email, admin: user.admin },
+      process.env.JWT_SECRET,
+      {
+        expiresIn: "1h",
+        issuer: "b4-phone-agent",
+        audience: "users",
+      },
+    );
+
+    res.status(200).json({ message: "Login successful", email, token });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Database error" });
   }
 });
 
-router.post("/call", async (req, res) => {
-  const { email, goal, phoneNumber } = req.body;
+router.post("/call", authenticateToken, async (req, res) => {
+  let { goal, phoneNumber } = req.body;
 
-  if (!email || !goal || !phoneNumber)
+  goal = xss(goal).trim();
+  phoneNumber = xss(phoneNumber).trim();
+
+  const email = req.user.email;
+
+  if (!goal || !phoneNumber)
     return res.status(400).json({ error: "Missing fields" });
 
   try {
+    await pool.query("UPDATE users SET api_calls = COALESCE(api_calls, 0) + 1 WHERE email = ?", [email]);
+    const [userRows] = await pool.query("SELECT api_calls FROM users WHERE email = ?", [email]);
+    const totalCalls = userRows[0].api_calls;
+
+    let warningMessage = null;
+    if (totalCalls > 20) {
+      warningMessage = "Limit Reached: You have consumed your 20 free API calls. Additional charges may apply.";
+    }
+
     const [result] = await pool.query("INSERT INTO calls (email) VALUES (?)", [
       email,
     ]);
@@ -137,7 +203,12 @@ router.post("/call", async (req, res) => {
       url: `https://valleybalfour.dev/voice?call_id=${callId}`,
     });
 
-    res.json({ call_id: callId, twilioCallSid: call.sid });
+    res.json({ 
+      call_id: callId, 
+      twilioCallSid: call.sid,
+      api_calls: totalCalls,
+      warning: warningMessage 
+    });
   } catch (err) {
     console.error("FULL ERROR:", err);
     res.status(500).json({ error: err.message });
@@ -178,7 +249,8 @@ router.post("/voice", async (req, res) => {
 router.post("/process-speech", async (req, res) => {
   const twiml = new VoiceResponse();
   const callId = req.query.call_id;
-  const userSpeech = req.body.SpeechResult || "";
+  let userSpeech = req.body.SpeechResult || "";
+  userSpeech = xss(userSpeech);
 
   if (!callId) {
     twiml.say("Error: call ID missing.");
@@ -226,20 +298,33 @@ router.post("/process-speech", async (req, res) => {
   }
 });
 
-router.get("/is-admin", async (req, res) => {
-  const { email } = req.query;
-  if (!email) return res.status(400).json({ error: "Email is required" });
+router.get("/my-dashboard", authenticateToken, async (req, res) => {
+  try {
+    const [rows] = await pool.query("SELECT email, api_calls, admin FROM users WHERE email = ?", [req.user.email]);
+
+    if (rows.length > 0) {
+      res.json({ 
+        email: rows[0].email, 
+        api_calls: rows[0].api_calls, 
+        is_admin: rows[0].admin // This matches the Dashboard.jsx 'is_admin' check
+      });
+    } else {
+      res.status(404).json({ error: "User not found" });
+    }
+
+  } catch (err) {
+    console.error("DASHBOARD CRASH:", err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+router.get("/admin/usage", authenticateToken, async (req, res) => {
+  if (!req.user.admin) return res.status(403).json({ error: "Admin access required." });
 
   try {
-    const [rows] = await pool.query("SELECT admin FROM users WHERE email = ?", [
-      email,
-    ]);
-    if (rows.length === 0)
-      return res.status(404).json({ error: "User not found" });
-
-    res.json({ admin: !!rows[0].admin });
+    const [rows] = await pool.query("SELECT id, email, api_calls, admin FROM users ORDER BY api_calls DESC");
+    res.json(rows);
   } catch (err) {
-    console.error(err);
     res.status(500).json({ error: "Server error" });
   }
 });
