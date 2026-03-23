@@ -246,6 +246,32 @@ router.post("/call", authenticateToken, async (req, res) => {
   }
 });
 
+router.get("/api-usage", authenticateToken, async (req, res) => {
+  try {
+    const [rows] = await pool.query(
+      "SELECT api_calls FROM users WHERE email = ?",
+      [req.user.email],
+    );
+
+    if (rows.length === 0) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    const used = rows[0].api_calls || 0;
+    const limit = 20;
+    const remaining = Math.max(limit - used, 0);
+
+    res.json({
+      used,
+      limit,
+      remaining,
+    });
+  } catch (err) {
+    console.error("API USAGE ERROR:", err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
 router.post("/voice", async (req, res) => {
   const twiml = new VoiceResponse();
   const callId = req.query.call_id;
