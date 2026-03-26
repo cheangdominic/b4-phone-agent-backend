@@ -456,7 +456,7 @@ router.get("/my-dashboard", authenticateToken, async (req, res) => {
       res.json({ 
         email: rows[0].email, 
         api_calls: rows[0].api_calls, 
-        is_admin: rows[0].admin // This matches the Dashboard.jsx 'is_admin' check
+        is_admin: rows[0].admin
       });
     } else {
       res.status(404).json({ error: "User not found" });
