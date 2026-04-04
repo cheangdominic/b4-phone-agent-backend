@@ -10,6 +10,7 @@ import xss from "xss";
 import helmet from "helmet";
 import crypto from "crypto";
 import nodemailer from "nodemailer";
+import Groq from "groq-sdk";
 
 dotenv.config();
 
@@ -30,60 +31,24 @@ app.use(express.urlencoded({ extended: true }));
 const VoiceResponse = twilio.twiml.VoiceResponse;
 const client = twilio(process.env.TWILIO_SID, process.env.TWILIO_AUTH_TOKEN);
 
-async function getAIResponse(prompt) {
-  const url = "https://api.openai.com/v1/chat/completions";
+const groq = new Groq({
+  apiKey: process.env.GROQ_API_KEY,
+});
 
+async function getAIResponse(messages) {
   try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 20000);
-
-    const response = await fetch(url, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-      },
-      body: JSON.stringify({
-        model: "gpt-3.5-turbo",
-        messages: [
-          { role: "system", content: "You are a helpful AI voice assistant." },
-          { role: "user", content: prompt },
-        ],
-        temperature: 0.7,
-      }),
-      signal: controller.signal,
+    const completion = await groq.chat.completions.create({
+      model: "llama-3.3-70b-versatile",
+      messages: messages,
+      temperature: 0.8,
+      max_tokens: 100,
     });
 
-    clearTimeout(timeout);
-
-    const text = await response.text();
-
-    if (!response.ok) {
-      switch (response.status) {
-        case 401:
-          return "AI Error: Invalid OpenAI API key.";
-        case 429:
-          return "AI Error: Rate limit exceeded. Try again shortly.";
-        case 500:
-        case 502:
-        case 503:
-          return "AI Error: OpenAI servers are having issues.";
-        default:
-          return `AI Error (${response.status}): ${text.substring(0, 200)}`;
-      }
-    }
-
-    let data;
-    try {
-      data = JSON.parse(text);
-    } catch {
-      return "AI Error: Invalid JSON from OpenAI.";
-    }
-
-    const aiMessage = data?.choices?.[0]?.message?.content;
-    return aiMessage ? aiMessage.trim() : "AI Error: No response from OpenAI.";
+    const aiMessage = completion.choices?.[0]?.message?.content;
+    return aiMessage ? aiMessage.trim() : "AI Error: No response from Groq.";
   } catch (err) {
-    if (err.name === "AbortError") return "AI Error: Request timed out.";
+    if (err.status === 401) return "AI Error: Invalid Groq API key.";
+    if (err.status === 429) return "AI Error: Rate limit exceeded.";
     return `AI Error: ${err.message}`;
   }
 }
@@ -213,13 +178,20 @@ router.post("/call", authenticateToken, async (req, res) => {
     return res.status(400).json({ error: "Missing fields" });
 
   try {
-    await pool.query("UPDATE users SET api_calls = COALESCE(api_calls, 0) + 1 WHERE email = ?", [email]);
-    const [userRows] = await pool.query("SELECT api_calls FROM users WHERE email = ?", [email]);
+    await pool.query(
+      "UPDATE users SET api_calls = COALESCE(api_calls, 0) + 1 WHERE email = ?",
+      [email],
+    );
+    const [userRows] = await pool.query(
+      "SELECT api_calls FROM users WHERE email = ?",
+      [email],
+    );
     const totalCalls = userRows[0].api_calls;
 
     let warningMessage = null;
     if (totalCalls > 20) {
-      warningMessage = "Limit Reached: You have consumed your 20 free API calls. Additional charges may apply.";
+      warningMessage =
+        "Limit Reached: You have consumed your 20 free API calls. Additional charges may apply.";
     }
 
     const [result] = await pool.query("INSERT INTO calls (email) VALUES (?)", [
@@ -227,7 +199,62 @@ router.post("/call", authenticateToken, async (req, res) => {
     ]);
     const callId = result.insertId;
 
-    const aiMessage = await getAIResponse(goal);
+    const messages = [
+      {
+        role: "system",
+        content: `You are an AI-powered outbound phone assistant.
+
+CRITICAL RULES FOR VOICE:
+
+- Speak in short, natural responses (1–2 sentences, occasionally 3 max)
+- Keep things conversational, not robotic
+- Do NOT ramble or give long speeches
+- Sound like a real human on a phone call
+
+CONVERSATION STYLE:
+
+- It’s okay to briefly explain something if needed
+- Not every response needs to be a question
+- Mix between:
+  - short statements
+  - light explanations
+  - occasional questions
+
+- Questions should feel natural, not forced
+
+BAD:
+"Do you do marketing? What tools? What budget?"
+
+GOOD:
+"Got it — a lot of people I talk to are handling that manually right now.  
+Curious, are you doing that yourself or with a team?"
+
+FLOW:
+
+1. Start casual
+2. Add context naturally
+3. Guide the conversation (not interrogate)
+4. Keep it low-pressure
+
+TONE:
+
+- Friendly
+- Calm
+- Slightly persuasive
+- Never dramatic or intense
+
+IMPORTANT:
+
+- Avoid sounding scripted
+- Avoid asking too many questions in a row
+- Let the conversation breathe
+
+This is a LIVE PHONE CALL.`,
+      },
+      { role: "user", content: goal },
+    ];
+
+    const aiMessage = await getAIResponse(messages);
 
     await pool.query(
       "INSERT INTO conversations (call_id, sender, message) VALUES (?, ?, ?), (?, ?, ?)",
@@ -237,12 +264,260 @@ router.post("/call", authenticateToken, async (req, res) => {
     const call = await client.calls.create({
       to: phoneNumber,
       from: process.env.TWILIO_PHONE_NUMBER,
-      url: `https://valleybalfour.dev/b4backend/voice?call_id=${callId}`,
+      url: `http://localhost:5173/voice?call_id=${callId}`,
     });
 
     res.json({ call_id: callId, twilioCallSid: call.sid });
   } catch (err) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+router.post("/voice", async (req, res) => {
+  const twiml = new VoiceResponse();
+  const callId = req.query.call_id;
+
+  if (!callId) {
+    twiml.say("Error: call ID missing.");
+    return res.type("text/xml").send(twiml.toString());
+  }
+
+  let aiMessage = "Hello! How can I help you today?";
+  try {
+    const [rows] = await pool.query(
+      "SELECT message FROM conversations WHERE call_id = ? AND sender = 'ai' ORDER BY id DESC LIMIT 1",
+      [callId],
+    );
+    if (rows.length > 0) aiMessage = rows[0].message;
+  } catch {}
+
+  const endPhrases = ["goodbye", "talk to you later", "bye", "have a nice day"];
+  const isEnding = endPhrases.some((phrase) =>
+    aiMessage.toLowerCase().includes(phrase),
+  );
+
+  if (isEnding) {
+    twiml.say({ voice: "Polly.Amy" }, aiMessage);
+    twiml.hangup();
+  } else {
+    const gather = twiml.gather({
+      input: "speech",
+      action: `/b4backend/process-speech?call_id=${callId}`,
+      method: "POST",
+      timeout: 8,
+      speechTimeout: "auto",
+    });
+    gather.say({ voice: "Polly.Amy" }, aiMessage);
+    twiml.redirect(`/b4backend/voice?call_id=${callId}`);
+  }
+
+  res.type("text/xml").send(twiml.toString());
+});
+
+router.post("/process-speech", async (req, res) => {
+  const twiml = new VoiceResponse();
+  const callId = req.query.call_id;
+  let userSpeech = req.body.SpeechResult || "";
+  userSpeech = xss(userSpeech);
+
+  if (!callId) {
+    twiml.say("Error: call ID missing.");
+    return res.type("text/xml").send(twiml.toString());
+  }
+
+  try {
+    await pool.query(
+      "INSERT INTO conversations (call_id, sender, message) VALUES (?, ?, ?)",
+      [callId, "user", userSpeech],
+    );
+
+    const [conversationRows] = await pool.query(
+      "SELECT sender, message FROM conversations WHERE call_id = ? ORDER BY id ASC",
+      [callId],
+    );
+
+    const messages = conversationRows.map((row) => ({
+      role: row.sender === "user" ? "user" : "assistant",
+      content: row.message,
+    }));
+
+    messages.unshift({
+      role: "system",
+      content: `You are an AI-powered outbound phone assistant.
+
+CRITICAL RULES FOR VOICE:
+
+- Speak in short, natural responses (1–2 sentences, occasionally 3 max)
+- Keep things conversational, not robotic
+- Do NOT ramble or give long speeches
+- Sound like a real human on a phone call
+
+CONVERSATION STYLE:
+
+- It’s okay to briefly explain something if needed
+- Not every response needs to be a question
+- Mix between:
+  - short statements
+  - light explanations
+  - occasional questions
+
+- Questions should feel natural, not forced
+
+BAD:
+"Do you do marketing? What tools? What budget?"
+
+GOOD:
+"Got it — a lot of people I talk to are handling that manually right now.  
+Curious, are you doing that yourself or with a team?"
+
+FLOW:
+
+1. Start casual
+2. Add context naturally
+3. Guide the conversation (not interrogate)
+4. Keep it low-pressure
+
+TONE:
+
+- Friendly
+- Calm
+- Slightly persuasive
+- Never dramatic or intense
+
+IMPORTANT:
+
+- Avoid sounding scripted
+- Avoid asking too many questions in a row
+- Let the conversation breathe
+
+This is a LIVE PHONE CALL.`,
+    });
+
+    const aiResponse = await getAIResponse(messages);
+    await pool.query(
+      "INSERT INTO conversations (call_id, sender, message) VALUES (?, ?, ?)",
+      [callId, "ai", aiResponse],
+    );
+
+    const endPhrases = [
+      "goodbye",
+      "talk to you later",
+      "bye",
+      "have a nice day",
+    ];
+    const isEnding = endPhrases.some((phrase) =>
+      aiResponse.toLowerCase().includes(phrase),
+    );
+
+    if (isEnding) {
+      twiml.say({ voice: "Polly.Amy" }, aiResponse);
+      twiml.hangup();
+    } else {
+      const gather = twiml.gather({
+        input: "speech",
+        action: `/b4backend/process-speech?call_id=${callId}`,
+        method: "POST",
+        timeout: 8,
+        speechTimeout: "auto",
+      });
+      gather.say({ voice: "Polly.Amy" }, aiResponse);
+      twiml.redirect(`/b4backend/voice?call_id=${callId}`);
+    }
+
+    res.type("text/xml").send(twiml.toString());
+  } catch {
+    twiml.say("Sorry, something went wrong.");
+    res.type("text/xml");
+    res.send(twiml.toString());
+  }
+});
+
+router.get("/api-usage", authenticateToken, async (req, res) => {
+  try {
+    const [rows] = await pool.query(
+      "SELECT api_calls FROM users WHERE email = ?",
+      [req.user.email],
+    );
+
+    if (rows.length === 0) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    const used = rows[0].api_calls || 0;
+    const limit = 20;
+    const remaining = Math.max(limit - used, 0);
+
+    res.json({
+      used,
+      limit,
+      remaining,
+    });
+  } catch (err) {
+    console.error("API USAGE ERROR:", err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+router.get("/my-dashboard", authenticateToken, async (req, res) => {
+  try {
+    const [rows] = await pool.query(
+      "SELECT email, api_calls, admin FROM users WHERE email = ?",
+      [req.user.email],
+    );
+
+    if (rows.length > 0) {
+      res.json({
+        email: rows[0].email,
+        api_calls: rows[0].api_calls,
+        is_admin: rows[0].admin,
+      });
+    } else {
+      res.status(404).json({ error: "User not found" });
+    }
+  } catch (err) {
+    console.error("DASHBOARD CRASH:", err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+router.get("/admin/usage", authenticateToken, async (req, res) => {
+  if (!req.user.admin)
+    return res.status(403).json({ error: "Admin access required." });
+
+  try {
+    const [rows] = await pool.query(
+      "SELECT id, email, api_calls, admin FROM users ORDER BY api_calls DESC",
+    );
+    res.json(rows);
+  } catch (err) {
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+router.get("/ai-response", async (req, res) => {
+  const { prompt } = req.query;
+  if (!prompt)
+    return res.status(400).json({ error: "Missing prompt parameter." });
+
+  try {
+    const messages = [
+      { role: "system", content: "You are a helpful AI assistant." },
+      { role: "user", content: prompt },
+    ];
+
+    const aiResponse = await getAIResponse(messages);
+    res.json({
+      prompt,
+      response: aiResponse,
+      timestamp: new Date().toISOString(),
+      status: "success",
+    });
+  } catch (err) {
+    res.status(500).json({
+      error: "Failed to get AI response",
+      details: err.message,
+      timestamp: new Date().toISOString(),
+    });
   }
 });
 
@@ -324,186 +599,6 @@ router.post("/reset-password", async (req, res) => {
   }
 });
 
-app.get("/verify-token", async (req, res) => {
-  const token = req.query.token;
-
-  const [rows] = await pool.query("SELECT * FROM users WHERE reset_token = ?", [
-    token,
-  ]);
-
-  if (rows.length === 0) {
-    return res.json({ valid: false });
-  }
-
-  const user = rows[0];
-  if (Date.now() > user.reset_token_expiry) {
-    return res.json({ valid: false });
-  }
-
-  res.json({ valid: true });
-});
-
-router.get("/api-usage", authenticateToken, async (req, res) => {
-  try {
-    const [rows] = await pool.query(
-      "SELECT api_calls FROM users WHERE email = ?",
-      [req.user.email],
-    );
-
-    if (rows.length === 0) {
-      return res.status(404).json({ error: "User not found" });
-    }
-
-    const used = rows[0].api_calls || 0;
-    const limit = 20;
-    const remaining = Math.max(limit - used, 0);
-
-    res.json({
-      used,
-      limit,
-      remaining,
-    });
-  } catch (err) {
-    console.error("API USAGE ERROR:", err);
-    res.status(500).json({ error: "Server error" });
-  }
-});
-
-router.post("/voice", async (req, res) => {
-  const twiml = new VoiceResponse();
-  const callId = req.query.call_id;
-
-  if (!callId) {
-    twiml.say("Error: call ID missing.");
-    return res.type("text/xml").send(twiml.toString());
-  }
-
-  let aiMessage = "Hello! How can I help you today?";
-  try {
-    const [rows] = await pool.query(
-      "SELECT message FROM conversations WHERE call_id = ? AND sender = 'ai' ORDER BY id DESC LIMIT 1",
-      [callId],
-    );
-    if (rows.length > 0) aiMessage = rows[0].message;
-  } catch {}
-
-  const gather = twiml.gather({
-    input: "speech",
-    action: `/b4backend/process-speech?call_id=${callId}`,
-    method: "POST",
-  });
-  gather.say(aiMessage);
-
-  res.type("text/xml");
-  res.send(twiml.toString());
-});
-
-router.post("/process-speech", async (req, res) => {
-  const twiml = new VoiceResponse();
-  const callId = req.query.call_id;
-  let userSpeech = req.body.SpeechResult || "";
-  userSpeech = xss(userSpeech);
-
-  if (!callId) {
-    twiml.say("Error: call ID missing.");
-    return res.type("text/xml").send(twiml.toString());
-  }
-
-  try {
-    await pool.query(
-      "INSERT INTO conversations (call_id, sender, message) VALUES (?, ?, ?)",
-      [callId, "user", userSpeech],
-    );
-
-    const [conversationRows] = await pool.query(
-      "SELECT sender, message FROM conversations WHERE call_id = ? ORDER BY id ASC",
-      [callId],
-    );
-
-    let prompt = "";
-    conversationRows.forEach((row) => {
-      prompt += `${row.sender === "user" ? "User" : "AI"}: ${row.message}\n`;
-    });
-    prompt += "AI:";
-
-    const aiResponse = await getAIResponse(prompt);
-    await pool.query(
-      "INSERT INTO conversations (call_id, sender, message) VALUES (?, ?, ?)",
-      [callId, "ai", aiResponse],
-    );
-
-    twiml.say(aiResponse);
-    twiml.gather({
-      input: "speech",
-      action: `/b4backend/process-speech?call_id=${callId}`,
-      method: "POST",
-    });
-
-    res.type("text/xml");
-    res.send(twiml.toString());
-  } catch {
-    twiml.say("Sorry, something went wrong.");
-    res.type("text/xml");
-    res.send(twiml.toString());
-  }
-});
-
-router.get("/my-dashboard", authenticateToken, async (req, res) => {
-  try {
-    const [rows] = await pool.query("SELECT email, api_calls, admin FROM users WHERE email = ?", [req.user.email]);
-
-    if (rows.length > 0) {
-      res.json({ 
-        email: rows[0].email, 
-        api_calls: rows[0].api_calls, 
-        is_admin: rows[0].admin
-      });
-    } else {
-      res.status(404).json({ error: "User not found" });
-    }
-
-  } catch (err) {
-    console.error("DASHBOARD CRASH:", err);
-    res.status(500).json({ error: "Server error" });
-  }
-});
-
-router.get("/admin/usage", authenticateToken, async (req, res) => {
-  if (!req.user.admin) return res.status(403).json({ error: "Admin access required." });
-
-  try {
-    const [rows] = await pool.query("SELECT id, email, api_calls, admin FROM users ORDER BY api_calls DESC");
-    res.json(rows);
-  } catch (err) {
-    res.status(500).json({ error: "Server error" });
-  }
-});
-
-app.use("", router);
-router.get("/ai-response", async (req, res) => {
-  const { prompt } = req.query;
-  if (!prompt)
-    return res.status(400).json({ error: "Missing prompt parameter." });
-
-  try {
-    const aiResponse = await getAIResponse(prompt);
-    res.json({
-      prompt,
-      response: aiResponse,
-      timestamp: new Date().toISOString(),
-      status: "success",
-    });
-  } catch (err) {
-    res
-      .status(500)
-      .json({
-        error: "Failed to get AI response",
-        details: err.message,
-        timestamp: new Date().toISOString(),
-      });
-  }
-});
-
 router.get("/ai-response/html", async (req, res) => {
   const { prompt } = req.query;
 
@@ -520,7 +615,12 @@ router.get("/ai-response/html", async (req, res) => {
   }
 
   try {
-    const aiResponse = await getAIResponse(prompt);
+    const messages = [
+      { role: "system", content: "You are a helpful AI assistant." },
+      { role: "user", content: prompt },
+    ];
+
+    const aiResponse = await getAIResponse(messages);
     res.send(`
       <!DOCTYPE html><html><head><title>AI Response</title></head>
       <body>
@@ -539,7 +639,7 @@ router.get("/ai-response/html", async (req, res) => {
   }
 });
 
-app.use("/b4backend", router);
+app.use("", router);
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
