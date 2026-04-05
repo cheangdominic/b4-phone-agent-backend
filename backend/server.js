@@ -639,6 +639,252 @@ router.get("/ai-response/html", async (req, res) => {
   }
 });
 
+router.get("/admin/stats", authenticateToken, async (req, res) => {
+  if (!req.user.admin)
+    return res.status(403).json({ error: "Admin only" });
+
+  try {
+    const [[{ totalCalls }]] = await pool.query(
+      "SELECT COUNT(*) as totalCalls FROM calls"
+    );
+
+    const [[{ todayCalls }]] = await pool.query(`
+      SELECT COUNT(*) as todayCalls 
+      FROM calls 
+      WHERE DATE(started_at) = CURDATE()
+    `);
+
+    const [[{ avgCalls }]] = await pool.query(`
+      SELECT AVG(api_calls) as avgCalls FROM users
+    `);
+
+    res.json({
+      totalCalls,
+      todayCalls,
+      avgCalls: Math.round(avgCalls || 0),
+    });
+  } catch (err) {
+    console.error("STATS ERROR:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.get("/admin/usage-trend", authenticateToken, async (req, res) => {
+  if (!req.user.admin) return res.status(403).json({ error: "Admin only" });
+
+  try {
+    const [rows] = await pool.query(`
+      SELECT 
+        DATE(started_at) as date,
+        COUNT(*) as calls
+      FROM calls
+      GROUP BY DATE(started_at)
+      ORDER BY date ASC
+      LIMIT 7
+    `);
+
+    const formatted = rows.map(r => ({
+      day: new Date(r.date).toLocaleDateString("en-US", { weekday: "short" }),
+      calls: Number(r.calls),
+    }));
+
+    res.json(formatted);
+  } catch (err) {
+    console.error("USAGE TREND ERROR:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.get("/admin/user-calls", authenticateToken, async (req, res) => {
+  if (!req.user.admin) return res.status(403).json({ error: "Admin only" });
+
+  try {
+    const [rows] = await pool.query(`
+      SELECT email as name, api_calls as calls
+      FROM users
+      ORDER BY api_calls DESC
+      LIMIT 5
+    `);
+
+    res.json(rows);
+  } catch (err) {
+    console.error("USER CALLS ERROR:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.get("/admin/avg-messages", authenticateToken, async (req, res) => {
+  if (!req.user.admin) return res.status(403).json({ error: "Admin only" });
+
+  try {
+    const [[{ avgMessages }]] = await pool.query(`
+      SELECT AVG(msg_count) as avgMessages FROM (
+        SELECT COUNT(*) as msg_count
+        FROM conversations
+        GROUP BY call_id
+      ) as sub
+    `);
+
+    res.json({ avgMessages: Math.round(avgMessages || 0) });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.get("/admin/conversation-stats", authenticateToken, async (req, res) => {
+  if (!req.user.admin) return res.status(403).json({ error: "Admin only" });
+  
+  try {
+    const [[{ totalMessages }]] = await pool.query(
+      "SELECT COUNT(*) as totalMessages FROM conversations"
+    );
+    
+    const [[{ userMessages }]] = await pool.query(
+      "SELECT COUNT(*) as userMessages FROM conversations WHERE sender = 'user'"
+    );
+    
+    const [[{ aiMessages }]] = await pool.query(
+      "SELECT COUNT(*) as aiMessages FROM conversations WHERE sender = 'ai'"
+    );
+    
+    const [[{ avgMessagesPerCall }]] = await pool.query(`
+      SELECT AVG(msg_count) as avgMessagesPerCall FROM (
+        SELECT COUNT(*) as msg_count
+        FROM conversations
+        GROUP BY call_id
+      ) as sub
+    `);
+    
+    res.json({
+      totalMessages,
+      userMessages,
+      aiMessages,
+      avgMessagesPerCall: Math.round(avgMessagesPerCall || 0)
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.get("/admin/daily-messages", authenticateToken, async (req, res) => {
+  if (!req.user.admin) return res.status(403).json({ error: "Admin only" });
+  
+  try {
+    const [rows] = await pool.query(`
+      SELECT 
+        DATE(created_at) as date,
+        SUM(CASE WHEN sender = 'user' THEN 1 ELSE 0 END) as userMessages,
+        SUM(CASE WHEN sender = 'ai' THEN 1 ELSE 0 END) as aiMessages
+      FROM conversations
+      GROUP BY DATE(created_at)
+      ORDER BY date ASC
+      LIMIT 7
+    `);
+    
+    const formatted = rows.map(r => ({
+      day: new Date(r.date).toLocaleDateString("en-US", { weekday: "short" }),
+      userMessages: Number(r.userMessages),
+      aiMessages: Number(r.aiMessages)
+    }));
+    
+    res.json(formatted);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.get("/admin/user-activity", authenticateToken, async (req, res) => {
+  if (!req.user.admin) return res.status(403).json({ error: "Admin only" });
+  
+  try {
+    const [rows] = await pool.query(`
+      SELECT 
+        u.email,
+        u.api_calls,
+        COUNT(DISTINCT c.id) as unique_calls,
+        COUNT(DISTINCT conv.id) as total_messages
+      FROM users u
+      LEFT JOIN calls c ON u.email = c.email
+      LEFT JOIN conversations conv ON c.id = conv.call_id
+      GROUP BY u.email, u.api_calls
+      ORDER BY u.api_calls DESC
+    `);
+    
+    res.json(rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.get("/admin/hourly-distribution", authenticateToken, async (req, res) => {
+  if (!req.user.admin) return res.status(403).json({ error: "Admin only" });
+  
+  try {
+    const [rows] = await pool.query(`
+      SELECT 
+        HOUR(started_at) as hour,
+        COUNT(*) as calls
+      FROM calls
+      GROUP BY HOUR(started_at)
+      ORDER BY hour ASC
+    `);
+    
+    const formatted = rows.map(r => ({
+      hour: `${String(r.hour).padStart(2, '0')}:00`,
+      calls: Number(r.calls)
+    }));
+    
+    res.json(formatted);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.get("/admin/top-users", authenticateToken, async (req, res) => {
+  if (!req.user.admin) return res.status(403).json({ error: "Admin only" });
+  
+  try {
+    const [rows] = await pool.query(`
+      SELECT 
+        u.email,
+        u.api_calls,
+        COUNT(DISTINCT c.id) as total_calls
+      FROM users u
+      LEFT JOIN calls c ON u.email = c.email
+      GROUP BY u.email, u.api_calls
+      ORDER BY total_calls DESC
+      LIMIT 10
+    `);
+    
+    res.json(rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.get("/admin/recent-activity", authenticateToken, async (req, res) => {
+  if (!req.user.admin) return res.status(403).json({ error: "Admin only" });
+  
+  try {
+    const [rows] = await pool.query(`
+      SELECT 
+        c.id as call_id,
+        c.email,
+        c.started_at,
+        COUNT(conv.id) as message_count
+      FROM calls c
+      LEFT JOIN conversations conv ON c.id = conv.call_id
+      GROUP BY c.id, c.email, c.started_at
+      ORDER BY c.started_at DESC
+      LIMIT 10
+    `);
+    
+    res.json(rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.use("", router);
 
 const PORT = process.env.PORT || 3000;
