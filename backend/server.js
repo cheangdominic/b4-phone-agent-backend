@@ -9,8 +9,8 @@ import jwt from "jsonwebtoken";
 import xss from "xss";
 import helmet from "helmet";
 import crypto from "crypto";
-import nodemailer from "nodemailer";
 import Groq from "groq-sdk";
+import { Resend } from "resend";
 
 dotenv.config();
 
@@ -30,6 +30,7 @@ app.use(express.urlencoded({ extended: true }));
 
 const VoiceResponse = twilio.twiml.VoiceResponse;
 const client = twilio(process.env.TWILIO_SID, process.env.TWILIO_AUTH_TOKEN);
+const resend = new Resend(process.env.RESEND_API_KEY);
 
 const groq = new Groq({
   apiKey: process.env.GROQ_API_KEY,
@@ -168,15 +169,11 @@ router.post("/login", async (req, res) => {
 
 router.post("/call", authenticateToken, async (req, res) => {
   let { goal, phoneNumber } = req.body;
-
   goal = xss(goal).trim();
   phoneNumber = xss(phoneNumber).trim();
-
   const email = req.user.email;
-
   if (!goal || !phoneNumber)
     return res.status(400).json({ error: "Missing fields" });
-
   try {
     await pool.query(
       "UPDATE users SET api_calls = COALESCE(api_calls, 0) + 1 WHERE email = ?",
@@ -187,64 +184,43 @@ router.post("/call", authenticateToken, async (req, res) => {
       [email],
     );
     const totalCalls = userRows[0].api_calls;
-
     let warningMessage = null;
     if (totalCalls > 20) {
       warningMessage =
         "Limit Reached: You have consumed your 20 free API calls. Additional charges may apply.";
     }
-
-    const [result] = await pool.query("INSERT INTO calls (email) VALUES (?)", [
-      email,
-    ]);
+    const [result] = await pool.query(
+      "INSERT INTO calls (email, phone_number, goal, status) VALUES (?, ?, ?, ?)",
+      [email, phoneNumber, goal, "In Progress"],
+    );
     const callId = result.insertId;
-
     const messages = [
       {
         role: "system",
         content: `You are an AI-powered outbound phone assistant.
 
 CRITICAL RULES FOR VOICE:
-
 - Speak in short, natural responses (1–2 sentences, occasionally 3 max)
 - Keep things conversational, not robotic
 - Do NOT ramble or give long speeches
 - Sound like a real human on a phone call
 
 CONVERSATION STYLE:
-
-- It’s okay to briefly explain something if needed
+- It's okay to briefly explain something if needed
 - Not every response needs to be a question
-- Mix between:
-  - short statements
-  - light explanations
-  - occasional questions
-
+- Mix between short statements, light explanations, occasional questions
 - Questions should feel natural, not forced
 
-BAD:
-"Do you do marketing? What tools? What budget?"
-
-GOOD:
-"Got it — a lot of people I talk to are handling that manually right now.  
-Curious, are you doing that yourself or with a team?"
-
 FLOW:
-
 1. Start casual
 2. Add context naturally
 3. Guide the conversation (not interrogate)
 4. Keep it low-pressure
 
 TONE:
-
-- Friendly
-- Calm
-- Slightly persuasive
-- Never dramatic or intense
+- Friendly, Calm, Slightly persuasive, Never dramatic or intense
 
 IMPORTANT:
-
 - Avoid sounding scripted
 - Avoid asking too many questions in a row
 - Let the conversation breathe
@@ -253,23 +229,105 @@ This is a LIVE PHONE CALL.`,
       },
       { role: "user", content: goal },
     ];
-
     const aiMessage = await getAIResponse(messages);
-
     await pool.query(
       "INSERT INTO conversations (call_id, sender, message) VALUES (?, ?, ?), (?, ?, ?)",
       [callId, "user", goal, callId, "ai", aiMessage],
     );
-
     const call = await client.calls.create({
       to: phoneNumber,
       from: process.env.TWILIO_PHONE_NUMBER,
-      url: `http://localhost:5173/voice?call_id=${callId}`,
+      url: `https://valleybalfour.dev/b4backend/voice?call_id=${callId}`,
+      statusCallback: `https://valleybalfour.dev/b4backend/call-status?call_id=${callId}`,
+      statusCallbackMethod: "POST",
+      statusCallbackEvent: ["completed", "failed", "busy", "no-answer"],
     });
-
-    res.json({ call_id: callId, twilioCallSid: call.sid });
+    res.json({ call_id: callId, twilioCallSid: call.sid, warningMessage });
   } catch (err) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+router.get("/my-calls", authenticateToken, async (req, res) => {
+  try {
+    const page = parseInt(req.query.page) || 1;
+    const limit = 5;
+    const offset = (page - 1) * limit;
+
+    const [[{ total }]] = await pool.query(
+      "SELECT COUNT(*) as total FROM calls WHERE email = ?",
+      [req.user.email],
+    );
+
+    const [calls] = await pool.query(
+      "SELECT * FROM calls WHERE email = ? ORDER BY started_at DESC LIMIT ? OFFSET ?",
+      [req.user.email, limit, offset],
+    );
+
+    const callsWithMessages = await Promise.all(
+      calls.map(async (call) => {
+        const [messages] = await pool.query(
+          "SELECT sender, message, created_at FROM conversations WHERE call_id = ? ORDER BY id ASC",
+          [call.id],
+        );
+        return {
+          id: call.id,
+          phoneNumber: call.phone_number,
+          goal: call.goal,
+          status: call.status || "Completed",
+          timestamp: call.started_at,
+          messages,
+        };
+      }),
+    );
+
+    res.json({
+      calls: callsWithMessages,
+      totalPages: Math.ceil(total / limit),
+      currentPage: page,
+      total,
+    });
+  } catch (err) {
+    console.error("Error in /my-calls:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+router.get("/call-status-check", authenticateToken, async (req, res) => {
+  const { call_id } = req.query;
+  if (!call_id) return res.status(400).json({ error: "Missing call_id" });
+  try {
+    const [rows] = await pool.query(
+      "SELECT status FROM calls WHERE id = ? AND email = ?",
+      [call_id, req.user.email],
+    );
+    if (rows.length === 0)
+      return res.status(404).json({ error: "Call not found" });
+    res.json({ status: rows[0].status });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.post("/call-status", async (req, res) => {
+  const callId = req.query.call_id;
+  const callStatus = req.body.CallStatus;
+  if (!callId) return res.sendStatus(400);
+  try {
+    let status = "Completed";
+    if (
+      callStatus === "failed" ||
+      callStatus === "busy" ||
+      callStatus === "no-answer"
+    )
+      status = "Failed";
+    await pool.query("UPDATE calls SET status = ? WHERE id = ?", [
+      status,
+      callId,
+    ]);
+    res.sendStatus(200);
+  } catch (err) {
+    console.error("Call status update error:", err);
+    res.sendStatus(500);
   }
 });
 
@@ -523,10 +581,12 @@ router.get("/ai-response", async (req, res) => {
 
 router.post("/forgot-password", async (req, res) => {
   const { email } = req.body;
+
   try {
     const [rows] = await pool.query("SELECT * FROM users WHERE email = ?", [
       email,
     ]);
+
     if (rows.length > 0) {
       const token = crypto.randomBytes(32).toString("hex");
       const expiry = Date.now() + 1000 * 60 * 15;
@@ -536,23 +596,22 @@ router.post("/forgot-password", async (req, res) => {
         [token, expiry, email],
       );
 
-      const transporter = nodemailer.createTransport({
-        service: "gmail",
-        auth: { user: process.env.EMAIL, pass: process.env.EMAIL_PASS },
-      });
-
       const resetLink = `http://localhost:5173/reset-password?token=${token}`;
 
-      await transporter.sendMail({
+      await resend.emails.send({
+        from: process.env.EMAIL,
         to: email,
         subject: "Reset Your Password",
-        html: `<p>Click to reset your password:</p><a href="${resetLink}">${resetLink}</a>`,
+        html: `<p>Click <a href="${resetLink}">here</a> to reset your password</p>`,
       });
     }
-    res.json({ message: "If an account exists, a reset link has been sent." });
+
+    res.json({
+      message: "If an account exists, a reset link has been sent.",
+    });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Server error" });
+    console.error("FORGOT PASSWORD ERROR:", err);
+    res.status(500).json({ error: err.message });
   }
 });
 
@@ -599,6 +658,25 @@ router.post("/reset-password", async (req, res) => {
   }
 });
 
+router.get("/verify-token", async (req, res) => {
+  const token = req.query.token;
+
+  const [rows] = await pool.query("SELECT * FROM users WHERE reset_token = ?", [
+    token,
+  ]);
+
+  if (rows.length === 0) {
+    return res.json({ valid: false });
+  }
+
+  const user = rows[0];
+  if (Date.now() > user.reset_token_expiry) {
+    return res.json({ valid: false });
+  }
+
+  res.json({ valid: true });
+});
+
 router.get("/ai-response/html", async (req, res) => {
   const { prompt } = req.query;
 
@@ -636,6 +714,255 @@ router.get("/ai-response/html", async (req, res) => {
         <div>Error: ${escapeHtml(err.message)}</div>
       </body></html>
     `);
+  }
+});
+
+router.get("/admin/stats", authenticateToken, async (req, res) => {
+  if (!req.user.admin) return res.status(403).json({ error: "Admin only" });
+
+  try {
+    const [[{ totalCalls }]] = await pool.query(
+      "SELECT COUNT(*) as totalCalls FROM calls",
+    );
+
+    const [[{ todayCalls }]] = await pool.query(`
+      SELECT COUNT(*) as todayCalls 
+      FROM calls 
+      WHERE DATE(started_at) = CURDATE()
+    `);
+
+    const [[{ avgCalls }]] = await pool.query(`
+      SELECT AVG(api_calls) as avgCalls FROM users
+    `);
+
+    res.json({
+      totalCalls,
+      todayCalls,
+      avgCalls: Math.round(avgCalls || 0),
+    });
+  } catch (err) {
+    console.error("STATS ERROR:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.get("/admin/usage-trend", authenticateToken, async (req, res) => {
+  if (!req.user.admin) return res.status(403).json({ error: "Admin only" });
+
+  try {
+    const [rows] = await pool.query(`
+      SELECT 
+        DATE(started_at) as date,
+        COUNT(*) as calls
+      FROM calls
+      GROUP BY DATE(started_at)
+      ORDER BY date ASC
+      LIMIT 7
+    `);
+
+    const formatted = rows.map((r) => ({
+      day: new Date(r.date).toLocaleDateString("en-US", { weekday: "short" }),
+      calls: Number(r.calls),
+    }));
+
+    res.json(formatted);
+  } catch (err) {
+    console.error("USAGE TREND ERROR:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.get("/admin/user-calls", authenticateToken, async (req, res) => {
+  if (!req.user.admin) return res.status(403).json({ error: "Admin only" });
+
+  try {
+    const [rows] = await pool.query(`
+      SELECT email as name, api_calls as calls
+      FROM users
+      ORDER BY api_calls DESC
+      LIMIT 5
+    `);
+
+    res.json(rows);
+  } catch (err) {
+    console.error("USER CALLS ERROR:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.get("/admin/avg-messages", authenticateToken, async (req, res) => {
+  if (!req.user.admin) return res.status(403).json({ error: "Admin only" });
+
+  try {
+    const [[{ avgMessages }]] = await pool.query(`
+      SELECT AVG(msg_count) as avgMessages FROM (
+        SELECT COUNT(*) as msg_count
+        FROM conversations
+        GROUP BY call_id
+      ) as sub
+    `);
+
+    res.json({ avgMessages: Math.round(avgMessages || 0) });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.get("/admin/conversation-stats", authenticateToken, async (req, res) => {
+  if (!req.user.admin) return res.status(403).json({ error: "Admin only" });
+
+  try {
+    const [[{ totalMessages }]] = await pool.query(
+      "SELECT COUNT(*) as totalMessages FROM conversations",
+    );
+
+    const [[{ userMessages }]] = await pool.query(
+      "SELECT COUNT(*) as userMessages FROM conversations WHERE sender = 'user'",
+    );
+
+    const [[{ aiMessages }]] = await pool.query(
+      "SELECT COUNT(*) as aiMessages FROM conversations WHERE sender = 'ai'",
+    );
+
+    const [[{ avgMessagesPerCall }]] = await pool.query(`
+      SELECT AVG(msg_count) as avgMessagesPerCall FROM (
+        SELECT COUNT(*) as msg_count
+        FROM conversations
+        GROUP BY call_id
+      ) as sub
+    `);
+
+    res.json({
+      totalMessages,
+      userMessages,
+      aiMessages,
+      avgMessagesPerCall: Math.round(avgMessagesPerCall || 0),
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.get("/admin/daily-messages", authenticateToken, async (req, res) => {
+  if (!req.user.admin) return res.status(403).json({ error: "Admin only" });
+
+  try {
+    const [rows] = await pool.query(`
+      SELECT 
+        DATE(created_at) as date,
+        SUM(CASE WHEN sender = 'user' THEN 1 ELSE 0 END) as userMessages,
+        SUM(CASE WHEN sender = 'ai' THEN 1 ELSE 0 END) as aiMessages
+      FROM conversations
+      GROUP BY DATE(created_at)
+      ORDER BY date ASC
+      LIMIT 7
+    `);
+
+    const formatted = rows.map((r) => ({
+      day: new Date(r.date).toLocaleDateString("en-US", { weekday: "short" }),
+      userMessages: Number(r.userMessages),
+      aiMessages: Number(r.aiMessages),
+    }));
+
+    res.json(formatted);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.get("/admin/user-activity", authenticateToken, async (req, res) => {
+  if (!req.user.admin) return res.status(403).json({ error: "Admin only" });
+
+  try {
+    const [rows] = await pool.query(`
+      SELECT 
+        u.email,
+        u.api_calls,
+        COUNT(DISTINCT c.id) as unique_calls,
+        COUNT(DISTINCT conv.id) as total_messages
+      FROM users u
+      LEFT JOIN calls c ON u.email = c.email
+      LEFT JOIN conversations conv ON c.id = conv.call_id
+      GROUP BY u.email, u.api_calls
+      ORDER BY u.api_calls DESC
+    `);
+
+    res.json(rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.get(
+  "/admin/hourly-distribution",
+  authenticateToken,
+  async (req, res) => {
+    if (!req.user.admin) return res.status(403).json({ error: "Admin only" });
+
+    try {
+      const [rows] = await pool.query(`
+      SELECT 
+        HOUR(started_at) as hour,
+        COUNT(*) as calls
+      FROM calls
+      GROUP BY HOUR(started_at)
+      ORDER BY hour ASC
+    `);
+
+      const formatted = rows.map((r) => ({
+        hour: `${String(r.hour).padStart(2, "0")}:00`,
+        calls: Number(r.calls),
+      }));
+
+      res.json(formatted);
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  },
+);
+
+router.get("/admin/top-users", authenticateToken, async (req, res) => {
+  if (!req.user.admin) return res.status(403).json({ error: "Admin only" });
+
+  try {
+    const [rows] = await pool.query(`
+      SELECT 
+        u.email,
+        u.api_calls,
+        COUNT(DISTINCT c.id) as total_calls
+      FROM users u
+      LEFT JOIN calls c ON u.email = c.email
+      GROUP BY u.email, u.api_calls
+      ORDER BY total_calls DESC
+      LIMIT 10
+    `);
+
+    res.json(rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.get("/admin/recent-activity", authenticateToken, async (req, res) => {
+  if (!req.user.admin) return res.status(403).json({ error: "Admin only" });
+
+  try {
+    const [rows] = await pool.query(`
+      SELECT 
+        c.id as call_id,
+        c.email,
+        c.started_at,
+        COUNT(conv.id) as message_count
+      FROM calls c
+      LEFT JOIN conversations conv ON c.id = conv.call_id
+      GROUP BY c.id, c.email, c.started_at
+      ORDER BY c.started_at DESC
+      LIMIT 10
+    `);
+
+    res.json(rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 
