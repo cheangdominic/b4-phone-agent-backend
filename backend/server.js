@@ -718,11 +718,12 @@ router.get("/ai-response/html", async (req, res) => {
 });
 
 router.get("/admin/stats", authenticateToken, async (req, res) => {
-  if (!req.user.admin) return res.status(403).json({ error: "Admin only" });
+  if (!req.user.admin)
+    return res.status(403).json({ error: "Admin only" });
 
   try {
     const [[{ totalCalls }]] = await pool.query(
-      "SELECT COUNT(*) as totalCalls FROM calls",
+      "SELECT COUNT(*) as totalCalls FROM calls"
     );
 
     const [[{ todayCalls }]] = await pool.query(`
@@ -760,7 +761,7 @@ router.get("/admin/usage-trend", authenticateToken, async (req, res) => {
       LIMIT 7
     `);
 
-    const formatted = rows.map((r) => ({
+    const formatted = rows.map(r => ({
       day: new Date(r.date).toLocaleDateString("en-US", { weekday: "short" }),
       calls: Number(r.calls),
     }));
@@ -810,20 +811,20 @@ router.get("/admin/avg-messages", authenticateToken, async (req, res) => {
 
 router.get("/admin/conversation-stats", authenticateToken, async (req, res) => {
   if (!req.user.admin) return res.status(403).json({ error: "Admin only" });
-
+  
   try {
     const [[{ totalMessages }]] = await pool.query(
-      "SELECT COUNT(*) as totalMessages FROM conversations",
+      "SELECT COUNT(*) as totalMessages FROM conversations"
     );
-
+    
     const [[{ userMessages }]] = await pool.query(
-      "SELECT COUNT(*) as userMessages FROM conversations WHERE sender = 'user'",
+      "SELECT COUNT(*) as userMessages FROM conversations WHERE sender = 'user'"
     );
-
+    
     const [[{ aiMessages }]] = await pool.query(
-      "SELECT COUNT(*) as aiMessages FROM conversations WHERE sender = 'ai'",
+      "SELECT COUNT(*) as aiMessages FROM conversations WHERE sender = 'ai'"
     );
-
+    
     const [[{ avgMessagesPerCall }]] = await pool.query(`
       SELECT AVG(msg_count) as avgMessagesPerCall FROM (
         SELECT COUNT(*) as msg_count
@@ -831,12 +832,12 @@ router.get("/admin/conversation-stats", authenticateToken, async (req, res) => {
         GROUP BY call_id
       ) as sub
     `);
-
+    
     res.json({
       totalMessages,
       userMessages,
       aiMessages,
-      avgMessagesPerCall: Math.round(avgMessagesPerCall || 0),
+      avgMessagesPerCall: Math.round(avgMessagesPerCall || 0)
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -845,7 +846,7 @@ router.get("/admin/conversation-stats", authenticateToken, async (req, res) => {
 
 router.get("/admin/daily-messages", authenticateToken, async (req, res) => {
   if (!req.user.admin) return res.status(403).json({ error: "Admin only" });
-
+  
   try {
     const [rows] = await pool.query(`
       SELECT 
@@ -857,13 +858,13 @@ router.get("/admin/daily-messages", authenticateToken, async (req, res) => {
       ORDER BY date ASC
       LIMIT 7
     `);
-
-    const formatted = rows.map((r) => ({
+    
+    const formatted = rows.map(r => ({
       day: new Date(r.date).toLocaleDateString("en-US", { weekday: "short" }),
       userMessages: Number(r.userMessages),
-      aiMessages: Number(r.aiMessages),
+      aiMessages: Number(r.aiMessages)
     }));
-
+    
     res.json(formatted);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -872,7 +873,7 @@ router.get("/admin/daily-messages", authenticateToken, async (req, res) => {
 
 router.get("/admin/user-activity", authenticateToken, async (req, res) => {
   if (!req.user.admin) return res.status(403).json({ error: "Admin only" });
-
+  
   try {
     const [rows] = await pool.query(`
       SELECT 
@@ -886,21 +887,18 @@ router.get("/admin/user-activity", authenticateToken, async (req, res) => {
       GROUP BY u.email, u.api_calls
       ORDER BY u.api_calls DESC
     `);
-
+    
     res.json(rows);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-router.get(
-  "/admin/hourly-distribution",
-  authenticateToken,
-  async (req, res) => {
-    if (!req.user.admin) return res.status(403).json({ error: "Admin only" });
-
-    try {
-      const [rows] = await pool.query(`
+router.get("/admin/hourly-distribution", authenticateToken, async (req, res) => {
+  if (!req.user.admin) return res.status(403).json({ error: "Admin only" });
+  
+  try {
+    const [rows] = await pool.query(`
       SELECT 
         HOUR(started_at) as hour,
         COUNT(*) as calls
@@ -908,22 +906,21 @@ router.get(
       GROUP BY HOUR(started_at)
       ORDER BY hour ASC
     `);
-
-      const formatted = rows.map((r) => ({
-        hour: `${String(r.hour).padStart(2, "0")}:00`,
-        calls: Number(r.calls),
-      }));
-
-      res.json(formatted);
-    } catch (err) {
-      res.status(500).json({ error: err.message });
-    }
-  },
-);
+    
+    const formatted = rows.map(r => ({
+      hour: `${String(r.hour).padStart(2, '0')}:00`,
+      calls: Number(r.calls)
+    }));
+    
+    res.json(formatted);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
 router.get("/admin/top-users", authenticateToken, async (req, res) => {
   if (!req.user.admin) return res.status(403).json({ error: "Admin only" });
-
+  
   try {
     const [rows] = await pool.query(`
       SELECT 
@@ -936,7 +933,7 @@ router.get("/admin/top-users", authenticateToken, async (req, res) => {
       ORDER BY total_calls DESC
       LIMIT 10
     `);
-
+    
     res.json(rows);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -945,7 +942,7 @@ router.get("/admin/top-users", authenticateToken, async (req, res) => {
 
 router.get("/admin/recent-activity", authenticateToken, async (req, res) => {
   if (!req.user.admin) return res.status(403).json({ error: "Admin only" });
-
+  
   try {
     const [rows] = await pool.query(`
       SELECT 
@@ -959,7 +956,7 @@ router.get("/admin/recent-activity", authenticateToken, async (req, res) => {
       ORDER BY c.started_at DESC
       LIMIT 10
     `);
-
+    
     res.json(rows);
   } catch (err) {
     res.status(500).json({ error: err.message });
